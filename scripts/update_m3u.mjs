@@ -1,20 +1,92 @@
 /**
- * IPTV 直播源自动检测更新脚本
+ * IPTV 直播源自动检测更新脚本 v2
  *
  * 功能:
  * 1. 从 Gist 获取当前 M3U 播放列表
  * 2. 并行测试所有直播源连通性
  * 3. 对失效源从候选池自动替换
- * 4. 更新 Gist 并输出变更报告
+ * 4. 保护国内专有IP段, 防止海外运行器误判为失效
+ * 5. 更新 Gist 并输出变更报告
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, appendFileSync } from 'fs';
 
 const GIST_ID = '90b5ba5f5591a6fd6d4e5f1b7d5cc37c';
 const GIST_FILE = 'cctv.m3u';
 const POOL_FILE = new URL('./sources_pool.json', import.meta.url);
 const TIMEOUT_MS = 8000;
-const CONCURRENCY = 20;
+const CONCURRENCY = 15;
+
+// ========== 国内专有IP段保护 ==========
+// 以下服务器/域名仅在国内可访问, GitHub Actions海外运行器无法连接
+// 标记为"国内专用", 不自动替换
+const CHINA_ONLY_HOSTS = [
+  '222.223.41.27',      // CCTV主源 (国内IPTV)
+  '60.10.139.113',       // 河北联通IPTV备源
+  '112.123.243.37',      // 山西联通IPTV (已废弃,但保留规则)
+  '222.214.208.34',      // 四川联通IPTV
+  '123.129.70.178',      // 山东联通IPTV
+  '119.39.9.8',          // 山西联通IPTV
+  '116.128.243.121',     // 联通IPTV通用
+  '36.32.174.67',        // 山东联通IPTV
+  '58.56.162.102',       // 山东联通IPTV
+  '222.169.85.8',        // 吉林联通IPTV
+  '112.27.235.94',       // 安徽联通IPTV
+  '221.226.51.220',      // 江苏电信IPTV
+  '120.198.95.220',      // 广东移动IPTV
+  '124.228.160.176',     // 湖南移动IPTV
+  '218.13.170.98',       // 广东电信IPTV
+  '39.165.39.49',        // 移动IPTV
+  '113.25.252.226',      // 河南联通IPTV
+  '120.202.94.181',      // 湖北IPTV
+  '153.0.171.163',       // 联通IPTV
+  '120.211.62.180',      // 云南IPTV
+  '198.204.228.26',      // CDN (可能海外可访问)
+  '192.151.150.154',     // CDN (可能海外可访问)
+  '207.56.13.146',       // CDN (可能海外可访问)
+  '63.141.230.178',      // CDN (可能海外可访问)
+  '38.75.136.137',       // CDN (可能海外可访问)
+  '107.150.60.122',      // CDN (可能海外可访问)
+];
+
+function isChinaOnly(url) {
+  try {
+    const host = new URL(url).hostname;
+    return CHINA_ONLY_HOSTS.some(h => host.includes(h));
+  } catch {
+    return false;
+  }
+}
+
+// 官方CDN域名 — 全球可访问, 优先保留
+const GLOBAL_CDN_HOSTS = [
+  'bestv.cn', 'bestv.com.cn',
+  'cztv.com', 'ali-m-l.cztv.com', 'ali-xwl.cztv.com', 'l.cztvcloud.com',
+  'hljtv.com',
+  'hebtv.com',
+  'dxhmt.cn',
+  'yntv.net',
+  'cnr.cn', 'satellitepull.cnr.cn',
+  'mgtv.com', 'qing.mgtv.com',
+  'zohi.tv',
+  'iyb983.cn',
+  'hkstv.tv', 'webcast.hkstv.tv',
+  'wjyanghu.com',
+  'cssbyd.imwork.net',
+  'tv1288.xyz',
+  'kan0512.com',
+  'sdetv.com.cn',
+  'live.zbds.top',
+];
+
+function isGlobalCDN(url) {
+  try {
+    const host = new URL(url).hostname;
+    return GLOBAL_CDN_HOSTS.some(h => host.includes(h));
+  } catch {
+    return false;
+  }
+}
 
 // ========== 工具函数 ==========
 
@@ -57,6 +129,10 @@ async function ghApi(endpoint, options = {}) {
     },
     ...options
   });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`GitHub API ${resp.status}: ${text.slice(0, 200)}`);
+  }
   return resp.json();
 }
 
@@ -91,10 +167,10 @@ function parseM3u(content) {
 
 function rebuildM3u(entries) {
   const header = `#EXTM3U x-tvg-url="https://epg.deny.vip/sh/tel-epg.xml"
-#PLAYLIST: CCTV + 卫视频道 直播源 (自动维护)
+#PLAYLIST: CCTV + 卫视频道 直播源 (自动维护, GitHub Actions每日检测)
 #最后检测: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC
-#CCTV主源: 222.223.41.27:8888 备源: 60.10.139.113:8801
-#卫视频道自动检测替换, 候选池维护于 sources_pool.json
+#CCTV主源: 222.223.41.27:8888 (国内专用) 备源: 60.10.139.113:8801 (国内专用)
+#卫视频道自动检测替换, 候选池: sources_pool.json
 `;
   const groups = {};
   for (const e of entries) {
@@ -118,8 +194,9 @@ function rebuildM3u(entries) {
 // ========== 主流程 ==========
 
 async function main() {
-  console.log('=== IPTV 直播源自动检测 ===');
-  console.log(`时间: ${new Date().toISOString()}\n`);
+  console.log('=== IPTV 直播源自动检测 v2 ===');
+  console.log(`时间: ${new Date().toISOString()}`);
+  console.log(`注意: 运行器在海外, 国内专有IP段不可达属正常现象\n`);
 
   // 1. 获取当前 Gist 内容
   console.log('[1/5] 获取当前 Gist 播放列表...');
@@ -129,6 +206,11 @@ async function main() {
 
   const entries = parseM3u(currentContent);
   console.log(`  解析到 ${entries.length} 个频道条目`);
+
+  // 统计源类型
+  const chinaCount = entries.filter(e => isChinaOnly(e.rawUrl)).length;
+  const globalCount = entries.filter(e => isGlobalCDN(e.rawUrl)).length;
+  console.log(`  国内专用源: ${chinaCount} | 全球CDN源: ${globalCount} | 其他: ${entries.length - chinaCount - globalCount}\n`);
 
   // 2. 加载候选源池
   console.log('[2/5] 加载候选源池...');
@@ -145,40 +227,55 @@ async function main() {
       if (!entry) break;
       const result = await testUrl(entry.rawUrl);
       testResults.push({ entry, result });
-      const icon = result.ok ? '✓' : '✗';
-      console.log(`  ${icon} ${entry.name.padEnd(10)} ${result.ok ? 'OK' : result.reason}`);
+      const icon = result.ok ? '✓' : (isChinaOnly(entry.rawUrl) ? '⊘' : '✗');
+      const note = (!result.ok && isChinaOnly(entry.rawUrl)) ? '(国内专用,跳过替换)' : '';
+      console.log(`  ${icon} ${entry.name.padEnd(12)} ${result.ok ? 'OK' : result.reason + ' ' + note}`);
     }
   }
 
   const workers = Array.from({ length: CONCURRENCY }, () => worker());
   await Promise.all(workers);
 
-  // 4. 替换失效源
-  console.log('\n[4/5] 替换失效源...');
+  // 4. 智能替换失效源 (跳过国内专用源)
+  console.log('\n[4/5] 智能替换失效源...');
   const failed = testResults.filter(r => !r.result.ok);
+  const chinaUnreachable = failed.filter(r => isChinaOnly(r.entry.rawUrl));
+  const trulyFailed = failed.filter(r => !isChinaOnly(r.entry.rawUrl));
+
+  if (chinaUnreachable.length > 0) {
+    console.log(`  ⊘ ${chinaUnreachable.length} 个国内专用源在海外不可达, 保留不替换`);
+  }
+
   let replaced = 0;
   const changes = [];
 
-  for (const { entry } of failed) {
+  for (const { entry } of trulyFailed) {
+    console.log(`\n  处理: ${entry.name} (${entry.rawUrl.slice(0, 60)}...)`);
     const candidates = pool.channels[entry.name];
     if (!candidates || candidates.length === 0) {
-      console.log(`  ⚠ ${entry.name}: 无候选源可替换`);
+      console.log(`  ⚠ 无候选源, 保留原URL`);
       changes.push(`⚠ ${entry.name}: 无候选源, 保留原URL`);
       continue;
     }
 
-    // 找第一个不同于当前 URL 且可用的候选
+    // 优先选全球CDN候选, 再选IPTV候选
+    const sorted = [...candidates].sort((a, b) => {
+      const aGlobal = isGlobalCDN(a) ? 0 : 1;
+      const bGlobal = isGlobalCDN(b) ? 0 : 1;
+      return aGlobal - bGlobal;
+    });
+
     let found = false;
-    for (const candidate of candidates) {
-      if (candidate === entry.rawUrl) continue; // 跳过当前(已失效)的
-      console.log(`  尝试 ${entry.name}: ${candidate.slice(0, 60)}...`);
+    for (const candidate of sorted) {
+      if (candidate === entry.rawUrl) continue;
+      console.log(`  尝试: ${candidate.slice(0, 70)}...`);
       const r = await testUrl(candidate);
       if (r.ok) {
         const oldUrl = entry.rawUrl;
         entry.rawUrl = candidate;
         replaced++;
-        changes.push(`✓ ${entry.name}: ${oldUrl.slice(0,50)} → ${candidate.slice(0,50)}`);
-        console.log(`  ✓ ${entry.name} 已替换`);
+        changes.push(`✓ ${entry.name}: ${oldUrl.slice(0, 50)} → ${candidate.slice(0, 50)}`);
+        console.log(`  ✓ 已替换`);
         found = true;
         break;
       } else {
@@ -186,8 +283,8 @@ async function main() {
       }
     }
     if (!found) {
-      console.log(`  ⚠ ${entry.name}: 所有候选源均失效`);
-      changes.push(`⚠ ${entry.name}: ${candidates.length}个候选源均失效`);
+      console.log(`  ⚠ ${entry.name}: 所有${sorted.length}个候选源均失效, 保留原URL`);
+      changes.push(`⚠ ${entry.name}: ${sorted.length}个候选源均失效`);
     }
   }
 
@@ -198,38 +295,44 @@ async function main() {
     await ghApi(`gists/${GIST_ID}`, {
       method: 'PATCH',
       body: JSON.stringify({
-        files: { [GIST_FILE]: { content: newContent } }
+        files: { [GIST_FILE]: { content: newContent } },
+        description: `CCTV + 卫视频道 直播源 (${new Date().toISOString().slice(0, 10)}自动更新)`
       })
     });
-    console.log(`  ✓ 已更新, 替换了 ${replaced} 个失效源`);
+    console.log(`  ✓ Gist已更新, 替换了 ${replaced} 个失效源`);
   } else {
-    console.log('  无需更新, 所有源正常');
+    console.log('  ✓ 无需更新, 所有全球源正常');
   }
 
   // 输出报告
-  console.log('\n=== 检测报告 ===');
   const totalTested = testResults.length;
   const totalOk = totalTested - failed.length;
-  console.log(`总频道: ${totalTested} | 正常: ${totalOk} | 失效: ${failed.length} | 已修复: ${replaced}`);
+  console.log('\n' + '='.repeat(60));
+  console.log('=== 检测报告 ===');
+  console.log(`总频道: ${totalTested} | ✅全球可达: ${totalOk} | ❌失效: ${trulyFailed.length} | ⊘国内专用: ${chinaUnreachable.length} | 🔄已修复: ${replaced}`);
   if (changes.length > 0) {
     console.log('\n变更详情:');
     changes.forEach(c => console.log(`  ${c}`));
   }
 
-  // 输出 GitHub Actions 摘要
+  // GitHub Actions Step Summary
   if (process.env.GITHUB_STEP_SUMMARY) {
-    const summary = [
-      `## IPTV 源检测报告`,
-      `- 检测时间: ${new Date().toISOString()}`,
-      `- 总频道: ${totalTested} | ✅正常: ${totalOk} | ❌失效: ${failed.length} | 🔄已修复: ${replaced}`,
-      '',
+    const lines = [
+      `## 📡 IPTV 源检测报告`,
+      `- 🕐 检测时间: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`,
+      `- 📊 总频道: ${totalTested} | ✅ 正常: ${totalOk} | ❌ 全球失效: ${trulyFailed.length} | 🇨🇳 国内专用: ${chinaUnreachable.length} | 🔄 已修复: ${replaced}`,
+      ``,
     ];
-    if (changes.length > 0) {
-      summary.push('### 变更详情');
-      changes.forEach(c => summary.push(`- ${c}`));
+    if (chinaUnreachable.length > 0) {
+      lines.push(`### 🇨🇳 国内专用源 (海外不可达, 已保护保留)`);
+      chinaUnreachable.forEach(r => lines.push(`- ⊘ ${r.entry.name}`));
+      lines.push('');
     }
-    const fs = await import('fs');
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.join('\n') + '\n');
+    if (changes.length > 0) {
+      lines.push(`### 🔄 变更详情`);
+      changes.forEach(c => lines.push(`- ${c}`));
+    }
+    appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
   }
 }
 
