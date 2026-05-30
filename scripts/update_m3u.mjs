@@ -17,13 +17,14 @@ const POOL_FILE = new URL('./sources_pool.json', import.meta.url);
 const TIMEOUT_MS = 8000;
 const CONCURRENCY = 15;
 
-// ========== 国内专有IP段保护 ==========
-// 以下服务器/域名仅在国内可访问, GitHub Actions海外运行器无法连接
-// 标记为"国内专用", 不自动替换
-const CHINA_ONLY_HOSTS = [
-  '222.223.41.27',      // CCTV主源 (国内IPTV)
-  '60.10.139.113',       // 河北联通IPTV备源
-  '112.123.243.37',      // 山西联通IPTV (已废弃,但保留规则)
+// ========== 国内专用源保护列表 ==========
+// 以下所有IP/域名均纳入保护, 海外运行器测不到属正常现象, 绝不自动替换
+// 包括: 国内IPTV服务器 + 官方电视台CDN(可能面向中国受众优化,海外可能不可达)
+const PROTECTED_HOSTS = [
+  // --- 国内IPTV服务器 ---
+  '222.223.41.27',      // CCTV主源
+  '60.10.139.113',       // 河北联通IPTV (CCTV/卫视备源)
+  '112.123.243.37',      // 山西联通IPTV (已废弃,保留规则)
   '222.214.208.34',      // 四川联通IPTV
   '123.129.70.178',      // 山东联通IPTV
   '119.39.9.8',          // 山西联通IPTV
@@ -41,48 +42,53 @@ const CHINA_ONLY_HOSTS = [
   '120.202.94.181',      // 湖北IPTV
   '153.0.171.163',       // 联通IPTV
   '120.211.62.180',      // 云南IPTV
-  '198.204.228.26',      // CDN (可能海外可访问)
-  '192.151.150.154',     // CDN (可能海外可访问)
-  '207.56.13.146',       // CDN (可能海外可访问)
-  '63.141.230.178',      // CDN (可能海外可访问)
-  '38.75.136.137',       // CDN (可能海外可访问)
-  '107.150.60.122',      // CDN (可能海外可访问)
+  // --- 国内CDN (海外可能受限) ---
+  '198.204.228.26',      // CDN节点
+  '192.151.150.154',     // CDN节点
+  '207.56.13.146',       // CDN节点
+  '63.141.230.178',      // CDN节点
+  '38.75.136.137',       // CDN节点
+  '107.150.60.122',      // CDN节点
+  '111.61.236.247',      // 青海IPTV
+  // --- 官方电视台CDN (面向中国,海外可能不可达) ---
+  'hebtv.com',           // 河北广播电视台
+  'yntv.net',            // 云南广播电视台
+  'dxhmt.cn',            // 大河融媒体 (河南)
+  'hljtv.com',           // 黑龙江广播电视台
+  'iyb983.cn',           // 延边卫视
+  'hkstv.tv',            // 香港卫视 (可能亚洲优化)
+  'webcast.hkstv.tv',    // 香港卫视直播
+  'wjyanghu.com',        // 新疆镜像
+  'cssbyd.imwork.net',   // 国内动态DNS
+  'tv1288.xyz',          // 国内代理
+  'kan0512.com',         // 苏州台
+  'sdetv.com.cn',        // 山东教育台
+  'zohi.tv',             // 东南卫视 (可能国内优化)
+  // --- 真正全球CDN (不保护, 海外不可达 = 真的失效) ---
+  // bestv.cn / cztv.com / mgtv.com / cnr.cn 等大平台CDN全球可访问, 不在保护列表
 ];
 
-function isChinaOnly(url) {
+function isProtected(url) {
   try {
     const host = new URL(url).hostname;
-    return CHINA_ONLY_HOSTS.some(h => host.includes(h));
+    return PROTECTED_HOSTS.some(h => host.includes(h));
   } catch {
     return false;
   }
 }
 
-// 官方CDN域名 — 全球可访问, 优先保留
-const GLOBAL_CDN_HOSTS = [
-  'bestv.cn', 'bestv.com.cn',
-  'cztv.com', 'ali-m-l.cztv.com', 'ali-xwl.cztv.com', 'l.cztvcloud.com',
-  'hljtv.com',
-  'hebtv.com',
-  'dxhmt.cn',
-  'yntv.net',
-  'cnr.cn', 'satellitepull.cnr.cn',
-  'mgtv.com', 'qing.mgtv.com',
-  'zohi.tv',
-  'iyb983.cn',
-  'hkstv.tv', 'webcast.hkstv.tv',
-  'wjyanghu.com',
-  'cssbyd.imwork.net',
-  'tv1288.xyz',
-  'kan0512.com',
-  'sdetv.com.cn',
-  'live.zbds.top',
-];
-
+// 真正全球可访问的CDN — 海外测不通可以认为是真的失效
 function isGlobalCDN(url) {
   try {
     const host = new URL(url).hostname;
-    return GLOBAL_CDN_HOSTS.some(h => host.includes(h));
+    const globalHosts = [
+      'bestv.cn', 'bestv.com.cn',
+      'cztv.com', 'ali-m-l.cztv.com', 'ali-xwl.cztv.com', 'l.cztvcloud.com',
+      'cnr.cn', 'satellitepull.cnr.cn',
+      'mgtv.com', 'qing.mgtv.com',
+      'live.zbds.top',
+    ];
+    return globalHosts.some(h => host.includes(h));
   } catch {
     return false;
   }
@@ -208,7 +214,7 @@ async function main() {
   console.log(`  解析到 ${entries.length} 个频道条目`);
 
   // 统计源类型
-  const chinaCount = entries.filter(e => isChinaOnly(e.rawUrl)).length;
+  const chinaCount = entries.filter(e => isProtected(e.rawUrl)).length;
   const globalCount = entries.filter(e => isGlobalCDN(e.rawUrl)).length;
   console.log(`  国内专用源: ${chinaCount} | 全球CDN源: ${globalCount} | 其他: ${entries.length - chinaCount - globalCount}\n`);
 
@@ -227,8 +233,8 @@ async function main() {
       if (!entry) break;
       const result = await testUrl(entry.rawUrl);
       testResults.push({ entry, result });
-      const icon = result.ok ? '✓' : (isChinaOnly(entry.rawUrl) ? '⊘' : '✗');
-      const note = (!result.ok && isChinaOnly(entry.rawUrl)) ? '(国内专用,跳过替换)' : '';
+      const icon = result.ok ? '✓' : (isProtected(entry.rawUrl) ? '⊘' : '✗');
+      const note = (!result.ok && isProtected(entry.rawUrl)) ? '(国内专用,跳过替换)' : '';
       console.log(`  ${icon} ${entry.name.padEnd(12)} ${result.ok ? 'OK' : result.reason + ' ' + note}`);
     }
   }
@@ -239,8 +245,8 @@ async function main() {
   // 4. 智能替换失效源 (跳过国内专用源)
   console.log('\n[4/5] 智能替换失效源...');
   const failed = testResults.filter(r => !r.result.ok);
-  const chinaUnreachable = failed.filter(r => isChinaOnly(r.entry.rawUrl));
-  const trulyFailed = failed.filter(r => !isChinaOnly(r.entry.rawUrl));
+  const chinaUnreachable = failed.filter(r => isProtected(r.entry.rawUrl));
+  const trulyFailed = failed.filter(r => !isProtected(r.entry.rawUrl));
 
   if (chinaUnreachable.length > 0) {
     console.log(`  ⊘ ${chinaUnreachable.length} 个国内专用源在海外不可达, 保留不替换`);
