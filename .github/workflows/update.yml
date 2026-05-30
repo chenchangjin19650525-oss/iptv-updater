@@ -1,0 +1,40 @@
+name: IPTV 源自动检测更新
+
+on:
+  schedule:
+    # 每天北京时间 10:00 (UTC 2:00) 和 22:00 (UTC 14:00)
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
+    # 手动触发
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 运行源检测
+        id: check
+        run: node scripts/update_m3u.mjs
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+
+      - name: 提交源池更新
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scripts/sources_pool.json
+          if git diff --staged --quiet; then
+            echo "源池无变化"
+          else
+            git commit -m "chore: 更新候选源池 $(date +%Y-%m-%d)"
+            git push
+          fi
